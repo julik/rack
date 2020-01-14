@@ -4,26 +4,50 @@ require 'webrick'
 require 'stringio'
 require 'rack/content_length'
 
-# This monkey patch allows for applications to perform their own chunking
-# through WEBrick::HTTPResponse if rack is set to true.
-class WEBrick::HTTPResponse
-  attr_accessor :rack
-
-  alias _rack_setup_header setup_header
-  def setup_header
-    app_chunking = rack && @header['transfer-encoding'] == 'chunked'
-
-    @chunked = app_chunking if app_chunking
-
-    _rack_setup_header
-
-    @chunked = false if app_chunking
-  end
-end
-
 module Rack
   module Handler
     class WEBrick < ::WEBrick::HTTPServlet::AbstractServlet
+      # This extension allows for applications to
+      # configure chunking and perform it on their own, instead of doing it
+      # via webrick.
+      class RackWebrickResponse < ::WEBrick::HTTPResponse
+        attr_accessor :rack
+
+        def setup_header
+          app_chunking = rack && @header['transfer-encoding'] == 'chunked'
+          @chunked = app_chunking if app_chunking
+          super
+          @chunked = false if app_chunking
+        end
+
+        # If we have a Rack body response that is a hijack response or iterable,
+        # do not let the HTTPResponse read it. Instead, let the Rack 
+        # response wrapper write itself to the socket, bypassing WEBrick.
+        def send_body(socket) # :nodoc:
+          if @body.respond_to?(:is_rack_response?) && body.is_rack_response?
+            @body.write_to_socket(socket)
+          else
+            super
+          end
+        end
+      end
+
+      class HijackingBody < Struct.new(:handling_proc)
+        def is_rack_response?; true; end
+        def write_to_socket(socket)
+          handling_proc.call(socket)
+        end
+      end
+
+      class IterableBody < Struct.new(:wrapped_rack_body)
+        def is_rack_response?; true; end
+        def write_to_socket(socket)
+          wrapped_rack_body.each do |chunk|
+            socket.write(chunk)
+          end
+        end
+      end
+
       def self.run(app, options = {})
         environment  = ENV['RACK_ENV'] || 'development'
         default_host = environment == 'development' ? 'localhost' : nil
@@ -60,8 +84,13 @@ module Rack
         @app = app
       end
 
+      def create_request_and_response(with_webrick_config)
+        req = ::WEBrick::HTTPRequest.new(with_webrick_config)
+        res = RackWebrickResponse.new(with_webrick_config)
+        [req, res]
+      end
+
       def service(req, res)
-        res.rack = true
         env = req.meta_vars
         env.delete_if { |k, v| v.nil? }
 
@@ -105,17 +134,13 @@ module Rack
             end
           }
 
+          io_lambda = headers["rack.hijack"]
           if io_lambda
-            rd, wr = IO.pipe
-            res.body = rd
-            res.chunked = true
-            io_lambda.call wr
+            res.body = HijackingBody.new(io_lambda)
           elsif body.respond_to?(:to_path)
             res.body = ::File.open(body.to_path, 'rb')
           else
-            body.each { |part|
-              res.body << part
-            }
+            res.body = IterableBody.new(body)
           end
         ensure
           body.close  if body.respond_to? :close
